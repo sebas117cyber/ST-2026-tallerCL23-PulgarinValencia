@@ -1,0 +1,1348 @@
+---
+title: "Taller Clase 23 — Series de tiempo"
+subtitle: "Series de tiempo"
+author:
+  - "Isabela Pulgarin Durango"
+  - "Sebastián Valencia Botero"
+institute: "Departamento de Estadística - UNALMED"
+date: today
+lang: es
+df-print: paged
+toc: true
+toc-title: "Contenido"
+number-sections: true
+link-citations: true
+format:
+  html:
+    fig-dirs: figs
+    code-fold: show
+    code-tools: true
+    code-summary: "Mostrar/ocultar código"
+    embed-resources: true
+    theme: flatly
+    smooth-scroll: true
+editor_options:
+  chunk_output_type: inline
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+# Funciones
+
+```{r}
+# Cargar librerias
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(forecast)
+library(urca)
+library(uroot)
+library(knitr)
+```
+
+
+```{r}
+# Leer serie
+leer_serie <- function(x, col_fecha, col_valor, fuente, unidad) {
+  
+  datos <- read.csv(x)
+  
+  # Verificar que existan las columnas
+  if (!all(c(col_fecha, col_valor) %in% names(datos))) {
+    stop("Las columnas especificadas no existen en el CSV.")
+  }
+  
+  # Convertir fechas según su formato
+  fecha_original <- as.character(datos[[col_fecha]])
+  
+  if (all(grepl("^\\d{4}-\\d{2}$", fecha_original))) {
+    
+    # Formato mensual
+    fecha <- as.Date(paste0(fecha_original, "-01"))
+    frecuencia <- "mensual"
+    
+  } else if (all(grepl("^\\d{4}-T[1-4]$", fecha_original))) {
+    
+    # Formato trimestral
+    anio <- as.integer(substr(fecha_original, 1, 4))
+    trimestre <- as.integer(substr(fecha_original, 7, 7))
+    
+    mes <- c(1, 4, 7, 10)[trimestre]
+    
+    fecha <- as.Date(
+      paste(anio, mes, "01", sep = "-")
+    )
+    
+    frecuencia <- "trimestral"
+    
+  } else {
+    
+    stop("El formato de las fechas no es mensual ni trimestral")
+  }
+  
+  # Convertir valores
+  y <- as.numeric(datos[[col_valor]])
+  
+  # Verificaciones
+  if (any(is.na(fecha))) {
+    stop("Hay fechas inválidas en el CSV.")
+  }
+  
+  if (any(is.na(y))) {
+    stop("La serie contiene valores faltantes o no numéricos.")
+  }
+  
+  if (length(y) < 2) {
+    stop("Se necesitan al menos dos observaciones.")
+  }
+  
+  if (any(diff(fecha) <= 0)) {
+    stop("Las fechas deben estar en orden creciente y sin repetir.")
+  }
+  
+  # Crear serie estandarizada
+  resultado <- tibble::tibble(
+    t = seq_along(y),
+    fecha = fecha,
+    y = y
+  )
+  
+  # Guardar información adicional
+  attr(resultado, "frecuencia") <- frecuencia
+  attr(resultado, "fuente") <- fuente
+  attr(resultado, "unidad") <- unidad
+  
+  return(resultado)
+}
+```
+
+```{r}
+# Gráfica de la serie, ACF y PACF
+graficar_serie <- function(datos) {
+  
+  n <- nrow(datos)
+  
+  banda <- 1.96 / sqrt(n)
+  
+  # Serie
+  p_serie <- ggplot(datos, aes(x = fecha, y = y)) +
+    geom_line(color = "blue") +
+    labs(
+      x = "Fecha",
+      y = "CO2 (ppm)"
+    ) +
+    theme_minimal()
+  
+  # ACF
+  acf_obj <- acf(datos$y, plot = FALSE)
+  
+  acf_df <- data.frame(
+    rezago = as.numeric(acf_obj$lag),
+    acf = as.numeric(acf_obj$acf)
+  )
+  
+  p_acf <- ggplot(acf_df, aes(x = rezago, y = acf)) +
+    
+    geom_hline(yintercept = 0) +
+    
+    geom_hline(
+      yintercept = c(-banda, banda),
+      linetype = "dashed",
+      color = "purple"
+    ) +
+    
+    geom_segment(
+      aes(
+        xend = rezago,
+        yend = 0
+      ),
+      color = "blue"
+    ) +
+    
+    labs(
+      x = "Rezago",
+      y = "ACF"
+    ) +
+    
+    theme_minimal()
+  
+  # PACF
+  pacf_obj <- pacf(datos$y, plot = FALSE)
+  
+  pacf_df <- data.frame(
+    rezago = as.numeric(pacf_obj$lag),
+    pacf = as.numeric(pacf_obj$acf)
+  )
+  
+  p_pacf <- ggplot(pacf_df, aes(x = rezago, y = pacf)) +
+    
+    geom_hline(yintercept = 0) +
+    
+    geom_hline(
+      yintercept = c(-banda, banda),
+      linetype = "dashed",
+      color = "purple"
+    ) +
+    
+    geom_segment(
+      aes(
+        xend = rezago,
+        yend = 0
+      ),
+      color = "blue"
+    ) +
+    
+    labs(
+      x = "Rezago",
+      y = "PACF"
+    ) +
+    
+    theme_minimal()
+  
+  
+  figura <- p_serie +
+    (p_acf / p_pacf) +
+    plot_layout(
+      widths = c(2, 1)
+    )
+  
+  return(figura)
+}
+```
+
+```{r}
+#Perfil Box Cox
+perfil_boxcox <- function(z, s = 12, graficar = TRUE) {
+
+  n <- length(z)
+  m <- n - s - 5                      
+
+  z_media <- exp(mean(log(z)))        
+  lambdas <- round(seq(-2, 2, by = 0.01), 2)
+
+  S <- sapply(lambdas, function(lambda) {
+    if (abs(lambda) < 1e-10) {
+      z_trans <- z_media * log(z)
+  } else {
+  z_trans <- (z^lambda - 1) /
+    (lambda * z_media^(lambda - 1))
+  }
+
+    # Diferencia regular y estacional
+    dz <- diff(diff(z_trans), lag = s)
+
+    modelo <- arima(dz, order = c(4, 0, 0),
+                    include.mean = TRUE, method = "CSS")
+
+    # Solo los n* residuos del AR(4)
+    sum(residuals(modelo)[-(1:4)]^2)
+  })
+
+  S_min      <- min(S)
+  lambda_hat <- lambdas[which.min(S)]
+  G          <- m * log(S / S_min)
+  compatibles <- lambdas[G <= qchisq(0.95, 1)]   
+
+  if (graficar) {
+    plot(lambdas, G, type = "l", col = "blue",
+         xlab = expression(lambda), ylab = expression(G(lambda)),
+         main = "Perfil de Box y Cox")
+    abline(h = qchisq(0.95, 1), lty = 2)
+    abline(v = lambda_hat, col = "purple", lty = 2)
+  }
+
+  list(lambda_hat = lambda_hat, ic = range(compatibles),
+       lambda = lambdas, G = G)
+}
+```
+
+```{r}
+# Gráfica de la ACF
+graficar_acf <- function(serie, titulo, lag.max = 36) {
+
+  n <- length(serie)
+  banda <- 1.96 / sqrt(n)
+
+  # ACF
+  acf_obj <- acf(serie, lag.max = lag.max, plot = FALSE)
+
+  acf_df <- data.frame(
+    rezago = as.numeric(acf_obj$lag),
+    acf = as.numeric(acf_obj$acf)
+  )
+
+  p_acf <- ggplot(acf_df, aes(x = rezago, y = acf)) +
+    geom_hline(yintercept = 0) +
+    geom_hline(
+      yintercept = c(-banda, banda),
+      linetype = "dashed",
+      color = "purple"
+    ) +
+    geom_segment(
+      aes(xend = rezago, yend = 0),
+      color = "blue"
+    ) +
+    scale_x_continuous(breaks = seq(0, lag.max, by = 3)) +
+    labs(
+      title = titulo,
+      x = "Rezago",
+      y = "ACF"
+    ) +
+    theme_minimal()
+
+  return(p_acf)
+}
+```
+
+```{r}
+# Función para calcular n, varianza y rho(1)
+resumen_diferencias <- function(serie, etapa) {
+  
+  data.frame(
+    Etapa = etapa,
+    n = length(serie),
+    Varianza = var(serie),
+    rho1 = acf(serie, lag.max = 1, plot = FALSE)$acf[2]
+  )
+}
+```
+
+```{r}
+#Ajustar modelos CASO A
+ajustar <- function(p, q, P, Q) {
+  arima(co2_train$y, order = c(p, 1, q),
+        seasonal = list(order = c(P, 1, Q), period = 12))
+}
+```
+
+```{r}
+# Detectar atípicos
+detectar_atipicos <- function(modelo, delta = 0.7, umbral = 3.5) {
+
+  e <- as.numeric(residuals(modelo))
+  n <- length(e)
+
+  m1 <- coef(modelo)["ma1"]
+  m2 <- coef(modelo)["sma1"]
+
+  ini <- 14
+  sigma <- 1.483 * mad(e[ini:n], constant = 1)
+
+  aplicar_pi <- function(u) {
+    w <- diff(diff(c(rep(0, 13), u)), lag = 12)
+
+    as.numeric(stats::filter(
+      w,
+      c(-m1, rep(0, 10), -m2, -m1 * m2),
+      method = "recursive"
+    ))
+  }
+
+  resultados <- data.frame()
+
+  for (T in ini:n) {
+
+    t <- 1:n
+
+    patrones <- list(
+      AO = aplicar_pi(as.numeric(t == T)),
+      IO = as.numeric(t == T),
+      LS = aplicar_pi(as.numeric(t >= T)),
+      TC = aplicar_pi(ifelse(t >= T, delta^(t - T), 0))
+    )
+
+    for (tipo in names(patrones)) {
+
+      x <- patrones[[tipo]]
+
+      lambda <- sum(e[ini:n] * x[ini:n]) /
+        (sigma * sqrt(sum(x[ini:n]^2)))
+
+      resultados <- rbind(
+        resultados,
+        data.frame(T = T, tipo = tipo, lambda = lambda)
+      )
+    }
+  }
+
+  resultados$sig <- abs(resultados$lambda) > umbral
+
+  list(
+    sigma = sigma,
+    max_abs = max(abs(resultados$lambda)),
+    detectados = resultados[resultados$sig, ],
+    todo = resultados
+  )
+}
+```
+
+```{r}
+# Sobreajustar
+sobreajustar <- function(p, q, P, Q, extra) {
+
+  modelo <- arima(
+    co2_train$y,
+    order = c(p, 1, q),
+    seasonal = list(order = c(P, 1, Q), period = 12)
+  )
+
+  estimacion <- coef(modelo)[extra]
+  ee <- sqrt(diag(modelo$var.coef))[extra]
+  t <- estimacion / ee
+
+  data.frame(
+    Modelo = sprintf("(%d,1,%d)(%d,1,%d)[12]", p, q, P, Q),
+    Extra = extra,
+    Estimacion = estimacion,
+    EE = ee,
+    t = t,
+    Significativo = abs(t) > 1.96
+  )
+}
+```
+
+```{r}
+# Medidas de error
+metricas <- function(real, pronostico, escala) {
+  
+  error <- real - pronostico
+  
+  c(
+    RMSE = sqrt(mean(error^2)),
+    MAPE = mean(abs(error / real)) * 100,
+    MASE = mean(abs(error)) / escala
+  )
+}
+```
+
+
+
+
+
+# Caso A: el CO2 de Mauna Loa
+
+```{r}
+# Leer la serie
+co2 <- leer_serie(
+  "datos/co2-mauna-loa-mensual-2012-2025.csv",
+  col_fecha = "fecha",
+  col_valor = "co2_ppm",
+  fuente = "Mauna Loa",
+  unidad = "ppm"
+)
+```
+
+```{r}
+# Separar en entrenamiento y prueba
+n_prueba <- 12
+
+co2_train <- co2[1:(nrow(co2) - n_prueba), ]
+co2_test  <- co2[(nrow(co2) - n_prueba + 1):nrow(co2), ]
+```
+
+## A1. Mirar la serie
+
+### Gráfica de la serie, ACF y PACF
+
+```{r}
+graficar_serie(co2_train)
+```
+La serie de CO2 presenta una tendencia creciente y una marcada estacionalidad anual, con picos y valles que se repiten cada 12 meses. La ACF muestra un decaimiento lento y autocorrelaciones altas, lo que confirma una fuerte dependencia temporal. Por tanto, la serie no es estacionaria.
+
+
+### ¿Cuánto sube el $CO_2$ por año?
+
+```{r}
+# Incremento promedio anual
+co2_train$incremento_anual <- co2_train$y - dplyr::lag(co2_train$y, 12)
+
+incremento_promedio <- mean(
+  co2_train$incremento_anual,
+  na.rm = TRUE
+)
+
+# Incremento del último año
+ultimo_anio <- tail(
+  co2_train$incremento_anual[
+    !is.na(co2_train$incremento_anual)
+  ],
+  1
+)
+
+cat(
+  "Incremento anual promedio:", round(incremento_promedio, 2), "ppm\n",
+  "Incremento del último año:", round(ultimo_anio, 2), "ppm\n"
+)
+
+```
+Usando únicamente los datos de entrenamiento, el $CO_2$ presenta un incremento anual promedio de 2,53 ppm. En el último año del entrenamiento, el aumento fue de 3,53 ppm, superior al promedio, lo que indica un crecimiento reciente más acelerado.
+
+### Máximo, mínimo y oscilación del ciclo anual
+
+```{r}
+meses <- c(
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+)
+
+# Patrón mensual
+patron_mensual <- co2_train %>%
+  mutate(anio = as.numeric(format(fecha, "%Y")),
+         mes  = format(fecha, "%m")) %>%
+  filter(anio <= 2023) %>%
+  group_by(mes) %>%
+  summarise(promedio = mean(y), .groups = "drop") %>%
+  mutate(mes_nombre = meses[as.numeric(mes)])
+
+mes_max <- patron_mensual %>% slice_max(promedio, n = 1)
+mes_min <- patron_mensual %>% slice_min(promedio, n = 1)
+
+oscilacion <- mes_max$promedio - mes_min$promedio
+
+# Amplitud anual
+amplitud_anual <- co2_train %>%
+  mutate(anio = format(fecha, "%Y")) %>%
+  group_by(anio) %>%
+  filter(n() == 12) %>%
+  summarise(maximo = max(y), minimo = min(y), nivel = mean(y),
+            amplitud = maximo - minimo, .groups = "drop")
+
+oscilacion_promedio <- mean(amplitud_anual$amplitud)
+oscilacion_sd       <- sd(amplitud_anual$amplitud)
+
+tabla_ciclo <- data.frame(
+  Caracteristica = c(
+    "Máximo promedio",
+    "Mínimo promedio",
+    "Oscilación del patrón (máx - mín)",
+    "Oscilación anual media (máx - mín por año)",
+    "Desviación estándar de la oscilación anual"
+  ),
+  Mes = c(
+    mes_max$mes_nombre,
+    mes_min$mes_nombre,
+    paste(mes_max$mes_nombre, "-", mes_min$mes_nombre),
+    "2012-2023",
+    "2012-2023"
+  ),
+  CO2_ppm = c(
+    mes_max$promedio,
+    mes_min$promedio,
+    oscilacion,
+    oscilacion_promedio,
+    oscilacion_sd
+  )
+)
+
+tabla_ciclo$CO2_ppm <- round(tabla_ciclo$CO2_ppm, 2)
+
+tabla_ciclo
+```
+
+El ciclo anual del CO2 alcanza su máximo en mayo (410,71 ppm) y su mínimo en septiembre (404,74 ppm), con una oscilación de 5,97 ppm en el patrón mensual de los 12 años completos (2012 a 2023). Medida año por año, la oscilación media es de 5,99 ppm, casi igual a la anterior, con una desviación estándar de 0,43 ppm, lo que indica que la amplitud del ciclo es muy estable de un año a otro.
+
+### Gráfico del ciclo anual
+
+```{r}
+meses <- c(
+  "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+  "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"
+)
+
+ggplot(patron_mensual,
+       aes(x = as.numeric(mes), y = promedio)) +
+  geom_line(color = "blue") +
+  geom_point(color = "blue") +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = meses
+  ) +
+  labs(
+    x = "Mes",
+    y = "CO2 promedio (ppm)"
+  ) +
+  theme_minimal()
+```
+El gráfico muestra el ciclo anual del $CO_2$, calculado con los datos de entrenamiento. Se observa un aumento desde enero hasta alcanzar un máximo en mayo, seguido de un descenso hasta septiembre, cuando se registra el mínimo. Posteriormente, el nivel vuelve a aumentar hacia diciembre, evidenciando un patrón estacional que se repite cada año.
+
+### ¿La amplitud cambia con el nivel?
+
+```{r}
+ggplot(amplitud_anual,
+       aes(x = nivel, y = amplitud)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Nivel promedio de CO2 (ppm)",
+    y = "Amplitud anual (ppm)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+correlacion <- cor(
+  amplitud_anual$nivel,
+  amplitud_anual$amplitud
+)
+
+cat(
+  "Correlación entre el nivel promedio y la amplitud anual:",
+  round(correlacion, 3),
+  "\n"
+)
+```
+La amplitud anual del ciclo sí presenta un ligero cambio con el nivel de $CO_2$: tiende a disminuir a medida que aumenta la concentración ($r=-0,586$). Aunque los 12 puntos muestran cierta dispersión, la relación observada indica que la amplitud no aumenta con el nivel de la serie, sino que cambia ligeramente en sentido contrario al esperado si existiera un comportamiento multiplicativo marcado.
+
+## A2. ¿Hace falta transformar?
+
+### Perfil de Box-Cox
+
+```{r}
+res_A2 <- perfil_boxcox(co2_train$y)
+```
+### Intervalo de compatibilidad del 95 %
+
+
+```{r}
+cat("Lambda óptimo:", res_A2$lambda_hat, "\n",
+    "Intervalo de compatibilidad del 95%:", res_A2$ic[1], "a", res_A2$ic[2], "\n"
+    )
+```
+### Variabilidad relativa de la serie
+
+```{r}
+variacion_relativa <- (
+  max(co2_train$y) - min(co2_train$y)
+) / min(co2_train$y) * 100
+
+cat(
+  "Variación relativa entre el mínimo y el máximo:",
+  round(variacion_relativa, 2), "%\n"
+)
+```
+
+### Pruebas de hipótesis
+
+#### G(1)
+
+$\textbf{Prueba de Hipótesis:}$
+
+$$H_0:\lambda=1$$
+
+$$H_1:\lambda\neq1$$
+
+$\textbf{Estadístico de Prueba:}$
+
+$$G(1)=m\ln\left(\frac{S(1)}{S(\hat\lambda)}\right)$$
+
+$\textbf{Distribución bajo \(H_0\)}$	
+
+$$\chi^2_{gl=1}$$
+
+$\textbf{Región de rechazo:}$	
+
+$$G(1)>3,841$$
+```{r}
+# Prueba de hipótesis para lambda = 1
+
+G1 <- res_A2$G[which(res_A2$lambda == 1)]
+valor_critico <- qchisq(0.95, df = 1)
+
+
+cat("Estadístico de prueba G(1):", round(G1, 4), "\n",
+    "Valor crítico:", round(valor_critico, 4), "\n",
+    "Región de rechazo: G(1) >", round(valor_critico, 4), "\n")
+
+```
+#### G(0)
+
+$\textbf{Prueba de Hipótesis:}$
+
+$$H_0:\lambda=0$$
+
+$$H_1:\lambda\neq0$$
+
+$\textbf{Estadístico de Prueba:}$
+
+$$G(0)=m\ln\left(\frac{S(0)}{S(\hat\lambda)}\right)$$
+
+$\textbf{Distribución bajo \(H_0\)}$	
+
+$$\chi^2_{gl=1}$$
+
+$\textbf{Región de rechazo:}$	
+
+$$G(1)>3,841$$
+```{r}
+# Prueba de hipótesis para lambda = 0
+
+G2 <- res_A2$G[which(res_A2$lambda ==0)]
+valor_critico2 <- qchisq(0.95, df = 1)
+
+cat("Estadístico de prueba G(0):", round(G2, 4), "\n",
+    "Valor crítico:", round(valor_critico2, 4), "\n",
+    "Región de rechazo: G(0) >", round(valor_critico2, 4), "\n")
+
+```
+El perfil de Box y Cox, calculado sobre el entrenamiento, es casi plano: G(λ) sube suavemente desde 0 en λ = -2 hasta cerca de 3,4 en λ = 2 y nunca alcanza el valor crítico  $\chi^2_{1;0,95}$ = 3,8415. Por eso el intervalo del 95 % cubre toda la rejilla, de -2 a 2, y el $\hat{\lambda} = -2$ es solo el mínimo en el borde de la rejilla, no un valor que los datos prefieran de verdad. Para los dos valores que interesan, la región de rechazo al 5 % es $G(λ_0) > 3,8415$ y ninguno cae en ella: G(1) = 2,0768 (sin transformar) y G(0) = 1,0495 (logaritmo), de modo que no se rechaza λ = 1 ni λ = 0, y ambos son compatibles con los datos. El perfil casi no distingue entre transformaciones porque el nivel de la serie varía solo 9,11 % entre su mínimo y su máximo; en un rango tan angosto, $x^λ$, el logaritmo y la recta son prácticamente iguales, y el AR(4) de la doble diferencia tiene casi la misma suma de cuadrados con cualquiera de ellas. Como λ = 1 está dentro del intervalo y, según A1, la amplitud anual no crece con el nivel (r = -0,586), no hay señal de escala multiplicativa. Se decide no transformar (λ = 1), lo que además conserva la lectura en ppm y simplifica el pronóstico y sus intervalos.
+
+## A3. ¿Cuántas diferencias?
+
+
+### Primera diferencia ordinaria $\nabla Z_t$
+
+```{r}
+d1 <- diff(co2_train$y)
+
+graficar_acf(d1, titulo = "ACF de la primera diferencia ordinaria", lag.max = 36)
+```
+
+```{r}
+cat("ACF en los rezagos 12, 24 y 36:",
+    acf(d1, lag.max = 36, plot = FALSE)$acf[c(12, 24, 36) + 1], "\n")
+```
+La primera diferencia ordinaria permitió eliminar la tendencia, pues la ACF ya no presenta un decaimiento lento. Sin embargo, el componente estacional persiste, como lo muestra la onda periódica marcada, con autocorrelaciones altas en los rezagos 12, 24 y 36, cuyos valores son 0,8609, 0,7904 y 0,7261, respectivamente, superan las bandas de confianza y no decaen rápidamente. Esto sugiere que la serie aún no es estacional estacionaria, por lo que se requiere aplicar una diferencia estacional.
+
+### Primera diferencia estacional $\nabla_{12} Z_t$
+
+```{r}
+# Primera diferencia estacional
+d12 <- diff(co2_train$y, lag = 12)
+
+graficar_acf(d12, titulo = "ACF de la primera diferencia estacional", lag.max = 36)
+```
+
+```{r}
+cat("ACF en los rezagos 1 a 6:",
+    acf(d12, lag.max = 6,  plot = FALSE)$acf[2:7], "\n")
+```
+Al aplicar la diferencia estacional desaparece el patrón cíclico anual marcado. Sin embargo, persiste una correlación positiva en los primeros rezagos que disminuye gradualmente. Las autocorrelaciones en los rezagos 1 a 6 son 0,6710, 0,5342, 0,4738, 0,4217, 0,3409 y 0,3075, respectivamente. Este comportamiento, caracterizado por una disminución gradual de las autocorrelaciones, sugiere que la serie aún presenta no estacionariedad asociada a una tendencia. Por tanto, se requiere aplicar una diferencia ordinaria adicional, manteniendo la diferencia estacional.
+
+
+### Diferencia ordinaria y estacional $\nabla\nabla_{12}Z_t$
+
+```{r}
+# Diferencia regular y estacional
+d1_d12 <- diff(d12)
+
+graficar_acf(d1_d12, titulo = "ACF de la diferencia ordinaria y estacional", lag.max = 36)
+```
+
+Después de aplicar ambas diferencias, la ACF ya no presenta un decaimiento lento ni un patrón cíclico persistente. La mayoría de las autocorrelaciones oscilan alrededor de cero y se encuentran dentro de las bandas de confianza, lo que sugiere que la serie alcanzó la estacionariedad. Sin embargo, persisten algunos picos destacados en los rezagos 1, 11 y 12, que serán útiles para la identificación del modelo.
+
+### Justificación de d=1 y D=1
+
+```{r}
+# Diferencias adicionales
+d2_d12 <- diff(d1_d12)              # d = 2, D = 1
+d1_d12_2 <- diff(d1_d12, lag = 12)  # d = 1, D = 2
+
+# Función para calcular n, varianza y rho(1)
+resumen_diferencias <- function(serie, etapa) {
+  
+  data.frame(
+    Etapa = etapa,
+    n = length(serie),
+    Varianza = var(serie),
+    rho1 = acf(serie, lag.max = 1, plot = FALSE)$acf[2]
+  )
+}
+
+# Tabla
+tabla_diferencias <- dplyr::bind_rows(
+  resumen_diferencias(co2_train$y, "Original"),
+  resumen_diferencias(d1, "d = 1"),
+  resumen_diferencias(d12, "D = 1"),
+  resumen_diferencias(d1_d12, "d = 1, D = 1"),
+  resumen_diferencias(d2_d12, "d = 2, D = 1"),
+  resumen_diferencias(d1_d12_2, "d = 1, D = 2")
+)
+
+knitr::kable(
+  tabla_diferencias,
+  digits = 4,
+  col.names = c(
+    "Etapa", "n", "Varianza", expression(rho[1])
+  ),
+  caption = "Comparación de la varianza y la autocorrelación de primer orden"
+)
+```
+
+La serie original presenta una alta autocorrelación de primer orden ($\rho_1=0,9743$), asociada a su fuerte dependencia temporal. Después de aplicar las diferencias, la autocorrelación disminuye considerablemente y, con $d=1,D=1$, pasa a ser negativa ($\rho_1=-0,2936$). Al aplicar una diferencia regular adicional, la autocorrelación se hace aún más negativa ($\rho_1=-0,5613$) y la varianza aumenta de $0,2725$ a $0,7078$, lo que sugiere una posible sobrediferenciación. Por tanto, $d=1$ resulta suficiente.
+
+De forma similar, aplicar una segunda diferencia estacional aumenta la varianza de $0,2725$ a $0,8348$, sin una reducción relevante de $\rho_1$. Esto indica que $D=1$ es suficiente y no se justifica utilizar $D=2$. En conjunto, los resultados apoyan la elección $d=1,\ D=1$.
+
+
+
+### Raíces unitarias estacionales con la prueba HEGY
+
+$\textbf{Prueba de Hipótesis:}$
+
+$\textbf{Prueba de Hipótesis:}$
+
+$$ H_0: \text{Hay raíz unitaria en la frecuencia cero}$$
+$$ H_1: \text{No hay raíz unitaria en la frecuencia cero}$$
+
+
+$\textbf{Estadístico:}$
+
+$$
+t_1=
+\frac{\widehat{\pi}_1}
+{\operatorname{EE}(\widehat{\pi}_1)}
+$$
+
+No sigue una t de Student sino una distribución no estándar de tipo Dickey y Fuller, ajustada con constante, tendencia, dummies estacionales y 12 rezagos fijos (n = 153). 
+
+$\textbf{Región de rechazo:}$ 
+
+$$
+\text{valor p} < 0,05
+$$
+
+
+```{r}
+co2_ts <- ts(co2_train$y, start = c(2012, 1), frequency = 12)
+
+# Sin tendencia: constante + dummies estacionales
+hegy_sin <- hegy.test(co2_ts, deterministic = c(1, 0, 1),
+                      lag.method = "fixed", maxlag = 12)
+
+# Con tendencia: constante + tendencia + dummies estacionales
+hegy_con <- hegy.test(co2_ts, deterministic = c(1, 1, 1),
+                      lag.method = "fixed", maxlag = 12)
+```
+
+```{r}
+tabla_hegy <- data.frame(
+  Frecuencia = names(hegy_sin$statistics),
+  sin_est = hegy_sin$statistics, sin_p = hegy_sin$pvalues,
+  con_est = hegy_con$statistics, con_p = hegy_con$pvalues
+)
+
+knitr::kable(
+  tabla_hegy, digits = 4, row.names = FALSE,
+  col.names = c("Frecuencia", "Estadístico (sin tend.)", "Valor p (sin tend.)",
+                "Estadístico (con tend.)", "Valor p (con tend.)"),
+  caption = "Prueba HEGY para el CO2 de entrenamiento (n = 153)"
+)
+```
+
+La prueba HEGY, con constante, dummies estacionales y 12 rezagos fijos, no permite rechazar la hipótesis de raíz unitaria regular ($t_1$), ya que los valores p son 0,9742 sin tendencia y 0,0565 con tendencia. Esto indica que existe evidencia de una raíz unitaria regular y apoya la elección de $d=1$.
+
+En cuanto a las raíces estacionales, los resultados muestran diferencias entre las dos especificaciones. Sin tendencia, ninguna de las pruebas $F$ rechaza la hipótesis nula al 5 %. Con tendencia, se rechaza para $F_{5:6}$ $p=0,0376$ y para las pruebas conjuntas $F_{2:12}$ ($p=0,0256$) y $F_{1:12}$ ($p=0,0356$). En cambio, $F_{3:4}$, $F_{7:8}$, $F_{9:10}$ y $F_{11:12}$ no presentan evidencia suficiente para rechazarla.
+
+Como la hipótesis nula de estas pruebas $F$ plantea la existencia de raíces unitarias estacionales, los resultados indican que la evidencia no es concluyente: depende de si se incluye o no la tendencia. Por tanto, no se puede afirmar que el ciclo anual del $CO_2$ esté completamente libre de raíces unitarias estacionales.
+
+Si no existieran raíces unitarias estacionales, significaría que el patrón anual se mantiene relativamente estable a lo largo del tiempo, en lugar de cambiar de forma permanente de un año a otro.
+
+A pesar de estos resultados, utilizar $D=1$ sigue siendo una aproximación razonable. Esto se debe a que la ACF de la primera diferencia ordinaria presenta autocorrelaciones altas en los rezagos 12, 24 y 36, lo que muestra una fuerte dependencia anual. Además, la prueba HEGY no rechaza la existencia de raíces estacionales en la mayoría de las frecuencias.
+
+## A4. Identificar el modelo
+
+### Gráfico de la serie diferenciada
+
+```{r}
+d1_d12_df <- data.frame(
+  fecha = co2_train$fecha[14:nrow(co2_train)],
+  y = as.numeric(d1_d12)
+)
+
+graficar_serie(d1_d12_df)
+```
+La serie diferenciada no presenta tendencia, no muestra estacionalidad persistente, el patrón cíclico anual fue removido tras aplicar la diferencia estacional y sí es estacionaria, como lo confirma el rápido decaimiento de la ACF hacia cero dentro de las bandas de confianza.
+
+```{r}
+a <- acf(d1_d12,  lag.max = 24, plot = FALSE)$acf[-1]
+p <- pacf(d1_d12, lag.max = 24, plot = FALSE)$acf
+
+cat(
+  "ACF en los rezagos 1, 2, 11, 12, 13 y 24:\n",
+  round(a[c(1, 2, 11, 12, 13, 24)], 3), "\n\n",
+
+  "PACF en los rezagos 1, 2, 11, 12, 13 y 24:\n",
+  round(p[c(1, 2, 11, 12, 13, 24)], 3), "\n\n",
+
+  "Banda de confianza al 95 %:\n",
+  round(1.96 / sqrt(length(d1_d12)), 3), "\n"
+)
+```
+En la ACF de la doble diferencia, el rezago 1 es el único de la parte regular que supera la banda de confianza de ±0,166, con un valor de −0,294. El rezago 2 (−0,130) queda dentro de la banda. Esto sugiere un componente MA regular de orden $q=1$.
+
+En la parte estacional, el rezago 12 presenta una autocorrelación de −0,475, que supera la banda, mientras que el rezago 24 (−0,007) queda dentro. Esto sugiere un componente MA estacional de orden $Q=1$. Además, el rezago 11 (0,326) también sobresale, lo cual puede explicarse por la combinación de los componentes MA regular y estacional.
+
+En la PACF, los rezagos 1 y 2 (−0,294 y −0,237), así como los rezagos 11, 12 y 13 (0,392, −0,278 y −0,202), superan las bandas de confianza. Sin embargo, sus valores no muestran un corte claro, sino que disminuyen progresivamente. Este comportamiento también es compatible con componentes de promedio móvil.
+
+Por tanto, la lectura conjunta de la ACF y la PACF sugiere utilizar el modelo:
+$$
+SARIMA(0,1,1)(0,1,1)_{12}
+$$
+### BIC
+
+```{r}
+ajustar <- function(p, q, P, Q) {
+  arima(co2_train$y, order = c(p, 1, q),
+        seasonal = list(order = c(P, 1, Q), period = 12))
+}
+
+cand <- data.frame(
+  p = c(0, 0, 1, 1, 0),
+  q = c(1, 2, 1, 0, 1),
+  P = c(0, 0, 0, 0, 1),
+  Q = c(1, 1, 1, 1, 1)
+)
+
+tabla_bic <- do.call(rbind, lapply(seq_len(nrow(cand)), function(i) {
+  m <- with(cand[i, ], ajustar(p, q, P, Q))
+  data.frame(
+    Modelo = with(cand[i, ], sprintf("(%d,1,%d)(%d,1,%d)[12]", p, q, P, Q)),
+    k = length(coef(m)),
+    BIC = BIC(m)
+  )
+}))
+
+tabla_bic <- tabla_bic[order(tabla_bic$BIC), ]
+tabla_bic$dBIC <- tabla_bic$BIC - min(tabla_bic$BIC)
+tabla_bic
+```
+
+Se compararon cinco candidatos con d = 1, D = 1 y s = 12 sobre el entrenamiento (n = 153). El modelo $SARIMA(0,1,1)(0,1,1)_{12}$ tiene el menor BIC (145,48), con solo dos parámetros, y coincide con la lectura de la figura: un único rezago regular fuera de la banda en la ACF (rezago 1) y un único pico estacional (rezago 12). Por ello se escribe en orden_A el orden $(0,1,1)(0,1,1)_{12}$. El segundo candidato es $SARIMA(0,1,2)(0,1,1)_{12}$, con BIC de 148,14 (diferencia de 2,66 unidades). Se descarta porque agrega un parámetro regular que el BIC penaliza más de lo que mejora el ajuste, y porque la ACF regular corta en el rezago 1: el rezago 2 (−0,130) queda dentro de la banda de ±0,166. Tampoco se elige $(1,1,1)(0,1,1)_{12}$ (diferencia de 2,80), por el mismo motivo de parsimonia.
+
+## A5. Estimar, validar y buscar atípicos
+
+### Modelo estimado
+
+$$
+(1-B)(1-B^{12})Z_t
+=
+(1-\theta_1B)(1-\Theta_1B^{12})a_t.
+$$
+```{r}
+m_A <- arima(co2_train$y, order = c(0, 1, 1),
+             seasonal = list(order = c(0, 1, 1), period = 12))
+
+est <- coef(m_A)
+ee  <- sqrt(diag(m_A$var.coef))
+
+tabla_modelo <- data.frame(
+  Parametro  = c("theta1", "Theta1"),
+  R          = est,                 
+  Curso      = -est,                # theta1 = -ma1, Theta1 = -sma1
+  EE         = ee,
+  t          = est / ee,            # el signo del t cambia al convertir
+  row.names  = NULL
+)
+tabla_modelo
+```
+
+Los resultados de la estimación muestran que ambos parámetros de promedio móvil son negativos en la salida de R: $\text{ma1}=-0,4858$ y $\text{sma1}=-0,8161$. Sin embargo, siguiendo la convención del curso, sus signos se invierten, por lo que se obtienen $\theta_1=0,4858$ y $\Theta_1=0,8161$.
+
+Además, ambos parámetros presentan valores $t$ en valor absoluto superiores a 1,96 ($5,6339$ y $9,4022$, respectivamente), lo que indica que son estadísticamente significativos al 5 %. Por tanto, existe evidencia de que los componentes de promedio móvil regular y estacional contribuyen al modelo.
+
+Los resultados respaldan la estructura del modelo $SARIMA(0,1,1)(0,1,1)_{12}$.
+
+### Ljung Box
+
+$\textbf{Prueba ed Hipótesis:}$
+
+$$
+H_0:\rho_1=\rho_2=\cdots=\rho_{24}=0
+$$
+
+$$
+H_1:\text{Al menos una }\rho_k\neq 0
+$$
+$\textbf{Estadístico de prueba:}$
+
+$$
+Q= n(n+2)\sum_{k=1}^{24}
+\frac{\hat{\rho}_k^2}{n-k}
+$$
+$\textbf{Distribución bajo la hipótesis nula:}$
+
+$$
+Q\sim}\chi^2_{K-m=24-2=22}
+$$
+
+$\textbf{Región de Rechazo:}$
+
+$$Q > \chi^2_{0.95,22}$$
+```{r}
+resultado_lb <- Box.test(
+  residuals(m_A),
+  lag = 24,
+  type = "Ljung-Box",
+  fitdf = 2
+)
+
+cat(
+  "Prueba de Ljung-Box:\n",
+  "Estadístico Q =", round(resultado_lb$statistic, 4), "\n",
+  "Grados de libertad =", resultado_lb$parameter, "\n",
+  "Valor p =", round(resultado_lb$p.value, 4), "\n"
+)
+```
+El resultado de la prueba de Ljung-Box presenta un valor $p=0,6239$, como es mayor al nivel de significancia del 5 %, no se rechaza la hipótesis nula de ausencia de autocorrelación hasta el rezago 24.
+
+Por tanto, no hay evidencia suficiente de autocorrelación en los errores, lo que indica que estos se comportan aproximadamente como ruido blanco. El modelo supera satisfactoriamente esta prueba de validación.
+
+```{r}
+residuos <- residuals(m_A)
+
+acf_residuos <- acf(
+  residuos,
+  lag.max = 36,
+  plot = FALSE
+)
+
+datos_acf <- data.frame(
+  rezago = as.numeric(acf_residuos$lag)[-1],
+  acf = as.numeric(acf_residuos$acf)[-1]
+)
+
+banda <- 1.96 / sqrt(length(residuos))
+
+ggplot(datos_acf, aes(x = rezago, y = acf)) +
+  geom_hline(yintercept = 0, color = "black") +
+  geom_hline(
+    yintercept = c(-banda, banda),
+    color = "purple",
+    linetype = "dashed"
+  ) +
+  geom_segment(
+    aes(xend = rezago, y = 0, yend = acf),
+    color = "blue"
+  ) +
+  scale_x_continuous(breaks = seq(0, 36, 3)) +
+  labs(
+    title = "ACF de los residuos del modelo SARIMA",
+    x = "Rezago",
+    y = "Autocorrelación"
+  ) +
+  theme_minimal()
+```
+La ACF confirma los resultados de Ljung-Box: 35 de los 36 rezagos están dentro de las bandas de confianza del 95 %. Aunque el rezago 23 las supera ligeramente, es un caso aislado. Por tanto, no se observa autocorrelación sistemática y los errores se comportan aproximadamente como ruido blanco.
+
+
+### Jarque Bera
+
+$\textbf{Prueba de Hipótesis:}$
+
+$$
+H_0: \text{Los errores siguen una distribución normal}
+$$
+$$
+H_1: \text{Los errores no siguen una distribución normal}
+$$
+$\textbf{Estadístico de prueba:}$
+
+$$
+JB=n\left(\frac{S^2}{6}+\frac{(K-3)^2}{24}\right)
+$$
+$\textbf{Distribución bajo $H_0$:}$ 
+
+$$
+JB\sim\chi^2_2
+$$
+$\textbf{Región de Rechazo:}$
+
+$$
+JB > \chi^2_{0.95, 2}
+$$
+```{r}
+resultado_jb <- tseries::jarque.bera.test(residuals(m_A))
+
+cat(
+  "Prueba de Jarque-Bera:\n",
+  "Estadístico JB =", round(resultado_jb$statistic, 4), "\n",
+  "Grados de libertad =", resultado_jb$parameter, "\n",
+  "Valor p =", round(resultado_jb$p.value, 4), "\n"
+)
+```
+Como el valor $p=0,003$ es menor que el nivel de significancia de 0,05, se rechaza la hipótesis nula de normalidad. Por tanto, existe evidencia de que los errores del modelo no siguen una distribución normal.
+
+```{r}
+ggplot(data.frame(residuos = as.numeric(residuals(m_A))),
+       aes(sample = residuos)) +
+  stat_qq(color = "blue") +
+  stat_qq_line(color = "purple", linewidth = 1) +
+  labs(
+    title = "Gráfico Q-Q de los residuos del modelo SARIMA",
+    x = "Cuantiles teóricos",
+    y = "Cuantiles muestrales"
+  ) +
+  theme_minimal()
+```
+El gráfico Q-Q muestra un buen ajuste en la parte central, pero desviaciones importantes en la cola izquierda y un ligero alejamiento en la cola derecha. Esto evidencia falta de normalidad, principalmente por la presencia de valores extremos negativos, en relación con el resultado significativo de Jarque-Bera ($p=0,003$).
+
+### Valores Atípicos
+
+```{r}
+det_A <- detectar_atipicos(m_A)
+
+e_est <- as.numeric(residuals(m_A)) / det_A$sigma
+
+datos_est <- data.frame(
+  fecha = co2_train$fecha,
+  e_est = e_est
+)
+
+ggplot(datos_est, aes(x = fecha, y = e_est)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_hline(yintercept = c(-3.5, 3.5), linetype = "dashed", color = "purple") +
+  geom_hline(yintercept = 0) +
+  labs(
+    title = "Residuos estandarizados (IO) y umbral de ±3,5",
+    x = "Fecha",
+    y = "Residuos estandarizados"
+  ) +
+  theme_minimal()
+```
+El gráfico muestra que todos los residuos estandarizados se encuentran dentro de los límites de $\pm 3,5$. Por tanto, no se detectan valores atípicos innovadores (IO) significativos. Se observa una observación negativa cercana al límite inferior alrededor de 2013, pero no supera el umbral establecido.
+
+```{r}
+det_A <- detectar_atipicos(m_A)
+
+cat("Sigma robusta:", round(det_A$sigma, 4), "\n")
+cat("Máximo valor absoluto:", round(det_A$max_abs, 4), "\n")
+
+print(det_A$detectados)
+```
+
+```{r}
+det_A$todo[which.max(abs(det_A$todo$lambda)), ]
+```
+
+```{r}
+T0 <- 50
+det_A$todo[det_A$todo$T == T0 & det_A$todo$tipo == "IO", "lambda"]
+residuals(m_A)[T0] / det_A$sigma
+```
+
+La búsqueda de atípicos utiliza $\delta=0,7$ y una desviación estándar robusta de $0,4021$. El mayor valor absoluto encontrado fue $3,315$, correspondiente a un cambio transitorio (TC) en $T=52$. Como no supera el umbral de $3,5$, no se identifican observaciones atípicas.
+
+### Sobreajuste
+
+```{r}
+sobreajuste <- rbind(
+  sobreajustar(0, 2, 0, 1, "ma2"),
+  sobreajustar(1, 1, 0, 1, "ar1"),
+  sobreajustar(0, 1, 1, 1, "sar1")
+)
+
+sobreajuste
+```
+
+En los tres modelos de sobreajuste, los parámetros adicionales presentan valores de $|t|$ inferiores a 1,96, por lo que ninguno es estadísticamente significativo al 5 %. Esto indica que agregar un segundo componente MA regular, un componente AR regular o un componente AR estacional no mejora suficientemente el modelo original. Por tanto, se mantiene el modelo $SARIMA(0,1,1)(0,1,1)_{12}$, por ser más parsimonioso.
+
+### Intervalo de confianza $\hat{\Theta}$
+
+```{r}
+Theta <- -coef(m_A)["sma1"]
+ee_Theta <- sqrt(diag(m_A$var.coef))["sma1"]
+
+IC <- Theta + c(-1, 1) * 1.96 * ee_Theta
+
+cat(
+  "Intervalo de confianza del 95 % para Theta:\n",
+  "Límite inferior =", round(IC[1], 4), "\n",
+  "Límite superior =", round(IC[2], 4), "\n"
+)
+```
+El intervalo del 95 % para $\Theta_1$ es [0,646; 0,986]. No contiene el 1, aunque su extremo superior queda muy cerca de él. Un $\Theta_1$ cercano a 1 indica que el patrón estacional es casi determinista: se repite de un año a otro con muy poca evolución, y la diferencia estacional con D = 1 lo elimina a costa de cierta sobrediferenciación. Esto concuerda con la amplitud estable del ciclo en A1 y con HEGY, que no permitió afirmar con claridad que el ciclo anual tuviera raíces unitarias estacionales. Si $\Theta_1$ fuera exactamente 1, el patrón sería fijo y el pronóstico de largo plazo lo repetiría sin cambios.
+
+## A6. ¿Le gana el SARIMA a las referencias?
+
+### Medidas de error
+
+```{r}
+y_train <- co2_train$y
+y_test  <- co2_test$y
+
+h <- nrow(co2_test)
+
+# SARIMA
+pron_sarima <- predict(m_A, n.ahead = h)$pred
+
+# Ingenuo estacional
+pron_snaive <- tail(y_train, 12)[(seq_len(h) - 1) %% 12 + 1]
+
+# Holt-Winters aditivo
+y_train_ts <- ts(y_train, start = c(2012, 1), frequency = 12)
+modelo_hw  <- HoltWinters(y_train_ts, seasonal = "additive")
+pron_hw    <- predict(modelo_hw, n.ahead = h)
+```
+
+```{r}
+# Escala del ingenuo estacional
+escala_mase <- mean(
+  abs(y_train[(12 + 1):length(y_train)] - y_train[1:(length(y_train) - 12)])
+)
+```
+
+```{r}
+resultados <- rbind(
+  SARIMA = metricas(y_test, pron_sarima, escala_mase),
+  `Ingenuo estacional` = metricas(y_test, pron_snaive, escala_mase),
+  `Holt-Winters` = metricas(y_test, pron_hw, escala_mase)
+)
+
+round(resultados, 3)
+```
+En el tramo de validación, el modelo SARIMA presenta el mejor desempeño en las tres medidas: RMSE = 0,225 ppm, MAPE = 0,049 % y MASE = 0,082, frente a 0,282, 0,056 % y 0,095 de Holt-Winters aditivo, y 3,066, 0,708 % y 1,196 del ingenuo estacional. El MASE expresa el error absoluto medio en unidades del error del ingenuo estacional en el entrenamiento: un valor de 0,082 indica que el SARIMA presenta un error equivalente al 8,2 % del error de referencia, es decir, unas 12 veces menor. El ingenuo pierde tanto porque repite el valor de hace un año y no incorpora el crecimiento de la serie, de modo que su error se acerca al incremento anual (aprox 3 ppm). Holt-Winters queda cerca del SARIMA, y su diferencia en RMSE es de solo 0,057 ppm.
+
+### Intervalo de confianza
+
+```{r}
+h <- nrow(co2_test)
+
+pr <- predict(m_A, n.ahead = h)
+
+pron_sarima_ic <- data.frame(
+  fecha = co2_test$fecha,
+  observado = co2_test$y,
+  pron = as.numeric(pr$pred),
+  se = as.numeric(pr$se),
+  li = as.numeric(pr$pred) - qnorm(0.975) * as.numeric(pr$se),
+  ls = as.numeric(pr$pred) + qnorm(0.975) * as.numeric(pr$se)
+)
+
+pron_sarima_ic$en_intervalo <- with(
+  pron_sarima_ic,
+  observado >= li & observado <= ls
+)
+
+pron_sarima_ic
+```
+
+De los 12 valores observados en el tramo de validación, los 12 se encuentran dentro del intervalo de predicción del 95 % del SARIMA, obteniéndose una cobertura de 100 %. Esto indica una buena capacidad del modelo para representar la incertidumbre asociada a los pronósticos, ya que todos los valores observados fueron contenidos por los intervalos.
+
+## A7. El pronóstico del tablero
+
+### Justificación método elegido
+
+Para el tablero se eligió el $SARIMA(0,1,1)(0,1,1)_{12}$, reajustado con los 165 meses y con los mismos órdenes identificados en el entrenamiento. En A5 el modelo cumple los supuestos: el Ljung y Box con K = 24 no detecta autocorrelación residual (valor p = 0.6239), la búsqueda de atípicos no declara ninguno (máximo $|λ_j(T)|$ = 3,315 < 3,5) y los parámetros adicionales no son significativos, además de tener el menor BIC (145,48) con solo dos parámetros. En A6 obtuvo el menor error en el tramo de validación (RMSE = 0,225 ppm, MAPE = 0,049 % y MASE = 0,082), y 12 de los 12 valores observados cayeron dentro de su intervalo del 95 %. Holt-Winters quedó cerca (RMSE = 0,282 ppm), por lo que la ventaja del SARIMA es real pero pequeña, y el ingenuo estacional quedó muy atrás (RMSE = 3,066 ppm). Se prefiere el SARIMA porque, además de pronosticar mejor, entrega intervalos con base en un modelo validado.
+
+### Pronóstico mayo 2026
+
+```{r}
+# Serie completa
+y_full <- ts(c(co2_train$y, co2_test$y), start = c(2012, 1), frequency = 12)
+
+m_final <- arima(y_full, order = c(0, 1, 1),
+                 seasonal = list(order = c(0, 1, 1), period = 12))
+
+h  <- 12
+pr <- predict(m_final, n.ahead = h)
+
+pron_2026 <- data.frame(
+  fecha = seq(as.Date("2025-10-01"), by = "month", length.out = h),
+  pron  = as.numeric(pr$pred),
+  se    = as.numeric(pr$se)
+)
+pron_2026$li <- pron_2026$pron - qnorm(0.975) * pron_2026$se
+pron_2026$ls <- pron_2026$pron + qnorm(0.975) * pron_2026$se
+
+pron_2026
+```
+
+
+```{r}
+mayo <- pron_2026 %>% filter(fecha == as.Date("2026-05-01"))
+
+primero_430 <- pron_2026 %>% filter(pron > 430) %>% slice(1)
+
+cat(
+  "Pronóstico de mayo de 2026:", round(mayo$pron, 3), "ppm\n",
+  "IC 95%: [", round(mayo$li, 3), ",", round(mayo$ls, 3), "] ppm\n"
+)
+```
+
+
+```{r}
+# Primer mes con pronóstico > 430 ppm
+if (nrow(primero_430) > 0) {
+  cat(
+    "Primer mes con pronóstico > 430 ppm:\n",
+    "Fecha =", format(primero_430$fecha, "%Y-%m"), "\n",
+    "Pronóstico =", round(primero_430$pron, 3), "ppm\n\n"
+  )
+} else {
+  cat("Ningún mes del horizonte supera 430 ppm\n\n")
+}
+
+# Primer mes cuyo límite inferior supera 430 ppm
+pos_li <- which(pron_2026$li > 430)[1]
+
+if (!is.na(pos_li)) {
+  cat(
+    "Primer mes cuyo límite inferior del IC 95% supera 430 ppm:\n",
+    "Fecha =", format(pron_2026$fecha[pos_li], "%Y-%m"), "\n",
+    "Límite inferior =", round(pron_2026$li[pos_li], 3), "ppm\n\n"
+  )
+} else {
+  cat(
+    "Ningún límite inferior del IC 95% supera 430 ppm en el horizonte\n\n"
+  )
+}
+
+# Ancho del intervalo en el primer y duodécimo mes
+ancho_intervalo <- 2 * qnorm(0.975) * pron_2026$se[c(1, 12)]
+
+cat(
+  "Ancho del intervalo de predicción:\n",
+  "Primer mes =", round(ancho_intervalo[1], 3), "ppm\n",
+  "Mes 12 =", round(ancho_intervalo[2], 3), "ppm\n\n"
+)
+
+# Aumento relativo del error estándar
+cociente_se <- pron_2026$se[12] / pron_2026$se[1]
+
+cat(
+  "Cociente del error estándar (mes 12 / mes 1):\n",
+  round(cociente_se, 3), "\n"
+)
+```
+
+El pronóstico de mayo de 2026, que corresponde al máximo estacional, es de 432,760 ppm, con un intervalo del 95 % de [431,608; 433,912] ppm. El primer mes en que el pronóstico supera los 430 ppm es marzo de 2026, con 430,489 ppm.
+
+El intervalo de septiembre de 2026 es más ancho que el de octubre de 2025 porque, a medida que aumenta el horizonte de pronóstico, crece la incertidumbre y el modelo acumula el efecto de errores futuros. Por eso, el intervalo pasa de un ancho de 1,384 ppm a 2,692 ppm.
+
+Un supuesto que podría fallar es que el comportamiento de la serie se mantenga estable. Por ejemplo, si el próximo año ocurre un cambio inesperado en el crecimiento del $CO_2$, el modelo podría no anticiparlo.
+
+El equipo apuesta a que el observatorio registró por primera vez más de 430 ppm en marzo de 2026, aunque con poca firmeza: el pronóstico supera 430 por solo 0,49 ppm, y el intervalo de ese mes, [429,447; 431,531], incluye valores por debajo de 430. Marzo y abril son los dos meses plausibles, y abril es donde ya el límite inferior supera 430.
+
+### Tablero
+
+```{r}
+apellidos <- "pulgarin-valencia"
+
+# pron_2026 es la tabla de 12 filas de A7 (ajustada con los 165 meses)
+stopifnot(nrow(pron_2026) == 12)
+stopifnot(format(pron_2026$fecha[1], "%Y-%m") == "2025-10",
+          format(pron_2026$fecha[12], "%Y-%m") == "2026-09")
+
+salida <- data.frame(
+  pareja     = apellidos,
+  fecha      = format(pron_2026$fecha, "%Y-%m"),
+  pronostico = sprintf("%.3f", pron_2026$pron)
+)
+
+archivo <- paste0("reto-co2_", apellidos, ".csv")
+write.csv(salida, archivo, row.names = FALSE, quote = FALSE)
+
+# Verificación: debe verse con 12 filas y 3 columnas
+read.csv(archivo)
+cat(readLines(archivo), sep = "\n")
+```
+
+
+
+
+
+
+
+
+
+
