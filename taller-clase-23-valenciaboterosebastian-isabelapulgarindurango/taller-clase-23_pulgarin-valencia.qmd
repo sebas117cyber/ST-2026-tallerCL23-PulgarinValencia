@@ -1,30 +1,45 @@
 ---
 title: "Taller Clase 23 — Series de tiempo"
-subtitle: "Series de tiempo"
+subtitle: "Series de Tiempo — Pregrado en Estadística, UNAL Medellín"
 author:
   - "Isabela Pulgarin Durango"
   - "Sebastián Valencia Botero"
 institute: "Departamento de Estadística - UNALMED"
 date: today
 lang: es
-df-print: paged
 toc: true
 toc-title: "Contenido"
 number-sections: true
 link-citations: true
 format:
   html:
-    fig-dirs: figs
+    df-print: paged
     code-fold: show
     code-tools: true
     code-summary: "Mostrar/ocultar código"
     embed-resources: true
     theme: flatly
     smooth-scroll: true
+  pdf:
+    fig-width: 6
+    fig-height: 4
+    geometry:
+      - a4paper
+      - margin=1.5cm
+      - landscape
+    include-in-header:
+      text: |
+        \usepackage{tabularx}
+        \usepackage{xcolor}
+        \usepackage{array}
+        \usepackage{graphicx}
+knitr:
+  opts_chunk:
+    fig.path: "figs/"
 editor_options:
   chunk_output_type: inline
-editor: 
-  markdown: 
+editor:
+  markdown:
     wrap: 72
 ---
 
@@ -1340,9 +1355,911 @@ cat(readLines(archivo), sep = "\n")
 
 
 
+# CASO 2 Viajeros Reino unido - Australia
+
+
+```{r, results='hide'}
+
+# paquetes
+
+library(forecast)
+library(ggplot2)
+library(patchwork)
+library(tseries)
+library(readr)
+library(TSA)
+library(urca)
+library(tsoutliers)
+library(tibble)
+library(dplyr)
+library(stats)
+
+
+```
+
+```{r, include=FALSE}
+
+
+leer_serie <- function(x, fuente, unidad) {
+  
+  # Validamos que tipo de dato es: si es ts o ruta csv
+  if (is.ts(x)) {
+    
+    # Creamos las columnas para la base de datos
+    y <- as.numeric(x)
+    t <- 1:length(x)
+    inicio <- start(x)
+    frecuencia <- frequency(x)
+    
+    # Construimos la fecha
+    fecha_inicio <- as.Date(
+      # Le damos formato año-periodo-dia
+      paste(inicio[1], inicio[2], 1, sep = "-")
+    )
+    
+    # Calculamos cada cuánto tiempo avanza la serie
+    meses <- 12 / frecuencia
+    
+    # Construimos las fechas
+    fecha <- seq(
+      fecha_inicio,
+      by = paste(meses, "months"),
+      length.out = length(x)
+    )
+    
+    # Construimos la tabla
+    datos <- tibble(t, fecha, y) 
+    
+  } else if (is.character(x)) {
+    
+    # Es una ruta con una base csv
+    datos <- read.csv(x)
+    
+    # Validamos que las columnas fecha y valor estén en la base
+    if ("fecha" %in% names(datos) && "valor" %in% names(datos)) {
+      
+      # Convertimos el dataframe a tibble para trabajar mejor con algunas librerías
+      datos <- as_tibble(datos)
+      
+      # Creamos las columnas de la base
+      datos$fecha <- as.Date(datos$fecha)
+      datos <- datos[order(datos$fecha), ]
+      datos$y <- datos$valor
+      datos$t <- 1:nrow(datos)
+      
+      # Validamos frecuencia y si están espaciadas
+      diferencia <- as.numeric(diff(datos$fecha))
+      
+      if (any(diferencia <= 0)) {
+        stop("Las fechas deben ser crecientes")
+      }
+      
+      dif_pro <- median(diferencia)
+      
+      if (dif_pro == 1) {
+        frecuencia <- 365
+      } else if (dif_pro %in% 28:31) {
+        frecuencia <- 12
+      } else if (dif_pro %in% 89:92) {
+        frecuencia <- 4
+      } else if (dif_pro %in% 360:366) {
+        frecuencia <- 1
+      } else if (dif_pro == 7) {
+        frecuencia <- 52
+      } else {
+        stop("No se pudo inferir la frecuencia de la serie")
+      }
+      
+      # Permitimos un margen de error ya que no todos los meses tienen la misma cantidad de días
+      if ((max(diferencia) - min(diferencia)) > 3) {
+        stop("Las fechas no son equiespaciadas")
+      }
+      
+      datos <- tibble(
+        t = 1:nrow(datos),
+        fecha = datos$fecha,
+        y = datos$valor
+      )
+      
+    } else {
+      stop("El archivo debe contener las columnas fecha y valor")
+    }
+    
+  } else {
+    stop("x debe ser un objeto ts o una ruta a un archivo csv")
+  }
+  
+  # Atributos de los datos
+  attr(datos, "frecuencia") <- frecuencia
+  attr(datos, "fuente") <- fuente
+  attr(datos, "unidad") <- unidad
+  
+  return(datos)
+}
+
+```
+
+
+```{r,  results='hide'}
+
+
+
+ Serie_B_DT <- read_csv("datos/turistas-reino-unido-australia-trimestral.csv")
+
+# objeto ts
+
+
+SerieB_or <- Serie_B_DT |>
+  mutate(
+    anio      = as.numeric(sub("-T.*$", "", trimestre)),  # año
+    trim      = as.numeric(sub("^.*-T", "", trimestre))   # trimestre
+  ) |>
+  arrange(anio, trim)                                     
+
+# 3. Punto de inicio de la serie
+anio_inicio <- min(SerieB_or$anio)
+trim_inicio <- SerieB_or$trim[SerieB_or$anio == anio_inicio][1]
+
+# 4. Serie ts trimestral
+serie_ts_B <- ts(
+  SerieB_or$llegadas_miles,
+  start = c(anio_inicio, trim_inicio),
+  frequency = 4
+)
+
+
+Serie_B <- leer_serie(serie_ts_B, "Aerolineas UK-AUST", 
+                      "Numero de turistas registrados")
+
+remove(anio_inicio, trim_inicio, Serie_B_DT, SerieB_or)
+
+```
+
+
+```{r, include=FALSE}
+
+
+graficar_serie <- function(datos, titulo, color = "#7AC5CD",
+                           alpha = 0.8, mostrar_puntos = TRUE) {
+  
+  # datos: tibble creado con leer_serie()
+  # titulo: título del gráfico
+  # color: color de la línea y los puntos (hexadecimal o nombre de R)
+  # alpha: transparencia entre 0 (invisible) y 1 (opaco)
+  # mostrar_puntos: si es TRUE dibuja puntos sobre la línea
+  
+  
+  # Validamos que el color sea válido
+  color_ok <- tryCatch(
+    {
+      col2rgb(color)
+      TRUE
+    },
+    error = function(e) FALSE
+  )
+  if (!color_ok) {
+    stop("nombre no es válido. Usa un hexadecimal como '#CD661D' o un nombre de color de R")
+  }
+  
+  # Validamos alpha
+  if (!is.numeric(alpha) || alpha < 0 || alpha > 1) {
+    stop("'alpha' debe ser un número entre 0 y 1")
+  }
+  
+  # Aplicamos la transparencia al color elegido
+  color_final <- adjustcolor(color, alpha.f = alpha)
+  
+  # Información de los atributos
+  fuente <- attr(datos, "fuente")
+  unidad <- attr(datos, "unidad")
+  
+  # Número de observaciones
+  n <- nrow(datos)
+  
+  # Años de la serie, de 2 en 2
+  anio_ini <- as.numeric(format(min(datos$fecha), "%Y"))
+  anio_fin <- as.numeric(format(max(datos$fecha), "%Y"))
+  anios    <- seq(anio_ini, anio_fin, by = 2)
+  cortes   <- as.Date(paste0(anios, "-01-01"))
+  
+  # Gráfico
+  g <- ggplot(datos, aes(x = fecha, y = y)) +
+    geom_line(color = color_final, linewidth = 1.2)
+  
+  if (mostrar_puntos) {
+    g <- g + geom_point(
+      color = color_final,
+      size  = ifelse(n <= 60, 4, 1.5)
+    )
+  }
+  
+  g +
+    scale_x_date(
+      breaks = cortes,
+      labels = format(cortes, "%Y")
+    ) +
+    
+    labs(
+      title   = titulo,
+      x       = "Fecha",
+      y       = unidad,
+      caption = paste("Fuente:", fuente, "| Observaciones:", n)
+    ) +
+    
+    theme_minimal() +
+    
+    theme(
+      axis.line   = element_line(color = "black", linewidth = 0.4),
+      axis.ticks  = element_line(color = "black"),
+      
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_line(color = "grey85", linewidth = 0.5),
+      
+      plot.title   = element_text(size = 16, face = "bold", hjust = 0.5),
+      axis.title   = element_text(face = "bold"),
+      axis.text.x  = element_text(angle = 0, hjust = 0.5),
+      plot.caption = element_text(hjust = 0)
+    )
+}
+
+#--------------------Grafico correlograma-----------------------------#
+
+correlograma <- function(datos,m = NULL){
+  
+  # Extraemos la serie numérica
+  datos <- datos$y
+  
+  
+  T <- length(datos) #Numero de observaciones
+  
+  #Valida si m es null o diferente 
+  if(is.null(m)){
+    m <- min(floor(T/4),24)
+  }
+  
+  #-----------Funcion ACF Manual------------------#
+  ACF <- function(datos, h) {
+    
+    T <- length(datos)
+    promedio <- sum(datos) / T
+    denominador <- sum((datos - promedio)^2)
+    
+    producto <- c()
+    for (i in 1:T) {
+      resultado <- datos[i] - promedio
+      producto <- c(producto, resultado)
+    }
+    
+    valor <- c()
+    for (i in 1:(T - h)) {
+      resultado <- producto[i + h] * producto[i]
+      valor <- c(valor, resultado)
+    }
+    
+    acf <- sum(valor) / denominador
+    
+    return(acf)
+  }
+  
+  # Calculamos la ACF manual desde 1 hasta m
+  acf_manual <- c()
+  
+  for (h in 1:m) {
+    resultado <- ACF(datos, h)
+    acf_manual <- c(acf_manual, resultado)
+  }
+  
+  # ACF calculada por R
+  acf_r <- acf(datos, lag.max = m, plot = FALSE)$acf[-1]
+  
+  # Diferencias absolutas entre la ACF manual y la de R
+  diferencias <- abs(acf_manual - acf_r)
+  
+  # Maxima diferencia
+  diferencia_maxima <- max(diferencias)
+  
+  #-----------Calculamos la PACF con la funcion de R---------------#
+  pacf_r <- pacf(datos, lag.max = m, plot = FALSE)$acf
+  
+  # Creamos los datos para graficar la ACF
+  datos_acf <- data.frame(
+    rezago = 1:m,
+    valor = acf_manual
+  )
+  
+  # Creamos los datos para graficar la PACF
+  datos_pacf <- data.frame(
+    rezago = 1:m,
+    valor = as.numeric(pacf_r)
+  )
+  
+  # Calculamos la banda de confianza del 95 %
+  banda <- qnorm((1 + 0.95) / 2) / sqrt(T)
+  
+  # Funcion para crear los graficos ACF y PACF
+  graficar_correlacion <- function(datos, titulo, etiqueta_y) {
+    
+    ggplot(datos, aes(x = rezago, y = valor)) +
+      
+      # Barras verticales
+      geom_segment(
+        aes(xend = rezago, yend = 0)
+      ) +
+      
+      # Linea central
+      geom_hline(yintercept = 0) +
+      
+      # Banda superior
+      geom_hline(
+        yintercept = banda,
+        linetype = "dashed"
+      ) +
+      
+      # Banda inferior
+      geom_hline(
+        yintercept = -banda,
+        linetype = "dashed"
+      ) +
+      
+      labs(
+        title = titulo,
+        x = "Rezago",
+        y = etiqueta_y
+      ) +
+      
+      theme_minimal()
+  }
+  
+  # Grafico de la ACF
+  grafico_acf <- graficar_correlacion(
+    datos_acf,
+    "Función de Autocorrelación (ACF)",
+    "ACF"
+  )
+  
+  # Grafico de la PACF
+  grafico_pacf <- graficar_correlacion(
+    datos_pacf,
+    "Función de Autocorrelación Parcial (PACF)",
+    "PACF"
+  )
+  
+  # Unimos los graficos
+  panel <- grafico_acf / grafico_pacf
+  
+  return(list(acf =acf_manual, panel = panel,diferencia_maxima= diferencia_maxima))
+  
+}
+
+```
+
+## Grafico y ACF/PACF
+
+```{r}
+
+graficar_serie(Serie_B, "Flujo de turistas UK-AUSTRALIA 1990-2012", color = "#53868B", mostrar_puntos = FALSE)
+
+
+
+```
+
+
+```{r}
+
+Corre_OG <- correlograma(Serie_B, m = 24)
+
+Corre_OG$panel
+
+```
+
+
+## B1 Tranformacion
+
+
+
+```{r}
+
+lambda <- BoxCox.lambda(serie_ts_B, method = "guerrero")
+lambda
+
+```
+
+### Separacion de datos
+
+```{r}
+
+h     <- 8                                            # Para validacion
+train <- window(serie_ts_B, end   = c(2010, 3))       # entrenamiento
+test  <- window(serie_ts_B, start = c(2010, 4))       # validación: 2010-T4 a 2012-T3
+
+```
+
+
+### Analisis de oscilacion
+
+```{r}
+
+# Oscilación dentro de cada año: rango (máx - mín) y media anual
+df_B <- data.frame(valor = as.numeric(serie_ts_B),
+                   anio  = floor(time(serie_ts_B)),
+                   trim  = cycle(serie_ts_B))
+
+osc_anual <- do.call(rbind, lapply(split(df_B$valor, df_B$anio), function(z)
+  data.frame(media = mean(z), rango = max(z) - min(z))))
+
+osc_anual$cociente <- osc_anual$rango / osc_anual$media
+
+round(osc_anual[c("1990", "1991", "1992" , "2004", "2005", "2006"), ], 2)
+
+```
+
+
+En 1990 la oscilación dentro del año va de unos 48 a 95 mil visitantes, con rango cercano a 46.79 y media de 69.44 . En 2005 el rango de 131.68 y en 2006 de 153.08 indicando que el rango a aumentando significativamente con los añós y por ende no existe una varianza constante. 
+
+La amplitud crece con el nivel, mientras el cociente rango/media varia en un rango un poco amplio con una media de alrededor de 0.71 . Por lo que puede existir una escala multiplicativa favoreciendo a una transformacicion log
+
+### Prueba de lambda
+
+```{r}
+
+# Perfil de Box-Cox según la definición del enunciado
+n     <- length(serie_ts_B)     # 
+s     <- 4
+nstar <- n - s - 5              # 82
+
+S_lambda <- function(lam, x, s = 4) {
+  x <- as.numeric(x)
+  g <- exp(mean(log(x)))                              # mediageométrica
+  
+  z <- if (abs(lam) < 1e-8) g * log(x) else (x^lam - 1) / (lam * g^(lam - 1))
+  w <- diff(diff(z, lag = s))                              # ∇∇_s Z^(λ)
+  W <- embed(w, 5)                                         # AR(4) con constante
+  sum(residuals(lm(W[, 1] ~ W[, -1]))^2)
+}
+
+lam_hat  <- optimize(S_lambda, interval = c(-2, 2), x = serie_ts_B)$minimum
+
+S_hat    <- S_lambda(lam_hat, serie_ts_B)
+
+G_lambda <- function(lam) nstar * log(S_lambda(lam, serie_ts_B) / S_hat)
+
+tabla_G <- data.frame(lambda = c(1, 0.5, 0, lam_hat))
+tabla_G$G       <- sapply(tabla_G$lambda, G_lambda)
+tabla_G$p_valor <- pchisq(tabla_G$G, df = 1, lower.tail = FALSE)
+tabla_G
+qchisq(0.95, df = 1)                             
+
+# Intervalo de λ compatible con los datos: G(λ) <= 3,841
+grid_lam <- seq(-1, 2, by = 0.01)
+G_grid   <- sapply(grid_lam, G_lambda)
+range(grid_lam[G_grid <= qchisq(0.95, 1)])
+
+lambda   
+
+```
+
+Prueba de H0: λ = 1:
+
+$$
+H_0: \lambda = 1 \ ; H_1 : \lambda \neq 1
+$$
+
+
+
+El estadistico para $G(1) = n* ln[S(1)/S(λ)]$ con $n^*=82$ bajo la hipotesis nula se distribuye comp $\chi^2_1$
+
+Su region de rechazo es $G(1) > 3.841$
+
+Valores observados de la prueba: 
+
+$$
+G(1) = [ 39.02 ] \ ; \ valor \ p = [ 4.1932e-10  ].
+$$
+
+
+Decisión: se rechaza $H_0$ y se hace una tranformacion logaritmica a los datos para estabilizar la varianza
+
+
+
+El $\hat{\lambda}$ del perfil de verosimilitud es $0.0767$ y el intervalo de verosimili al 95% compatible con los datos es $[-0.18,\; 0.34]$. Con $G(0.5) = 9.23$ ($p = 0.0024$, se rechaza la raíz cuadrada) y $G(0) = 0.3267$ ($p = 0.5676$), el logaritmo ($\lambda = 0$) es la transformación elegida porque $G(0) < 3.841$ y $\lambda = 0$ cae dentro del intervalo de confianza descartandola. En consecuencia, se trabaja con $\ln Z_t$.
+
+
+## B2
+
+```{r}
+
+lz   <- log(serie_ts_B)                 # ln Z_t
+d4lz <- diff(lz, lag = 4)               # ∇4 ln Z_t
+
+
+ac_lz <- acf(lz,   lag.max = 24, plot = FALSE)
+ac_d4 <- acf(d4lz, lag.max = 24, plot = FALSE)
+data.frame(rezago = c(4, 8, 12),
+           ln_Z   = ac_lz$acf[c(4, 8, 12)],
+           d4_lnZ = ac_d4$acf[c(4, 8, 12)])
+
+
+```
+
+```{r}
+acf(lz,   lag.max = 24, main = "ACF de ln Z")
+```
+
+```{r}
+acf(d4lz, lag.max = 24, main = "ACF de ∇4 ln Z")
+```
+
+
+```{r}
+
+# Dickey-Fuller aumentada sobre ∇4 ln Z, tipo deriva
+
+Pmax   <- floor(12 * (length(d4lz) / 100)^(1/4))    
+adf_d4 <- ur.df(d4lz, type = "drift", lags = Pmax, selectlags = "BIC")
+summary(adf_d4)
+adf_d4@lags                       # rezagos aumentados elegidos por BIC
+
+adf_d4@teststat                                      # estadístico tau2
+
+adf_d4@cval                                          # valores críticos
+
+
+```
+
+
+En los rezagos $4, 8$ y $12$, la ACF de $\ln Z_t$ vale $[0.921,\; 0.833,\; 0.742]$ decaw lentamente, mientras que tras aplicar la diferencia estacional $\nabla_4 \ln Z_t$ cae a $[-0.117,\; 0.222,\; 0.209]$, confirmando que $D = 1$.
+
+
+Prueba Dickey-Fuller para la serie tranformada y diferenciada estacionalmente  ($\nabla_4 \ln Z_t$)
+
+$$
+H_0 : y =0 \ (no \ estacionaria) \; H_1: y < 0 \ (estacionaria)
+$$
+
+Prueba ADF sobre $\nabla_4 \ln Z_t$ (modelo con deriva): Rezagos aumentados elegidos por BIC: $P = 4$ (observables en z.diff.lag1 a z.diff.lag4 de la regresión) con $P_{\text{máx}} = 11$. 
+
+Región de rechazo al 5%: $\tau_2 < -2.89$. Valor observado: $\tau_2 = -1.5858$.
+
+
+No se rechaza $H_0$ ($-1.5858 > -2.89$).
+
+Como no se rechaza $H_0$, $\nabla_4 \ln Z_t$ todavía presenta una raíz unitaria regular, por lo que es necesaria una diferenciación regular adicional ($d = 1$), pasando a trabajar con $\nabla \nabla_4 \ln Z_t$.
+
+## B3
+
+```{r}
+
+w2 <- diff(diff(lz, lag = 4))           # ∇∇4 ln Z_t
+
+
+acf(w2,  lag.max = 24, main = "ACF de ∇∇4 ln Z")
+
+
+
+
+```
+
+```{r}
+
+pacf(w2, lag.max = 24, main = "PACF de ∇∇4 ln Z")
+
+
+```
+
+### tabla BIC
+
+```{r}
+
+grilla <- expand.grid(p = 0:2, q = 0:2, P = 0:1, Q = 0:1)
+
+tabla_bic <- do.call(rbind, lapply(seq_len(nrow(grilla)), function(i) {
+  g   <- grilla[i, ]
+  fit <- try(arima(lz, order = c(g$p, 1, g$q),
+                   seasonal = list(order = c(g$P, 1, g$Q), period = 4),
+                   method = "ML"), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+  data.frame(modelo = sprintf("(%d,1,%d)(%d,1,%d)4", g$p, g$q, g$P, g$Q),
+             k = length(coef(fit)), AIC = AIC(fit), BIC = BIC(fit))
+}))
+
+tabla_bic <- tabla_bic[order(tabla_bic$BIC), ]
+head(tabla_bic, 6)
+
+```
+
+
+El patrón de truncamiento en el rezago 1($-0.613$) de la ACF regular y en el rezago 5($0.501$) de la ACF estacional sugiere un $\text{MA}(1)$ regular y un $\text{MA}(1)$ estacional
+
+El primer candidato es el modelo airline, $\text{ARIMA}(0,1,1)(0,1,1)_4$, con $\text{BIC} = -191.5330$.EN la ACF, se observa un único pico negativo fuertemente significativo en el rezago 1 seguido de un corte abrupto, manteniéndose los rezagos $2$ al $11$ dentro de las bandas de confianza. Este patrón es característico de un proceso MA(1).En la PACF, el primer rezago también es negativo y significativo ($\approx -0.42$), pero en lugar de cortarse bruscamente, presenta un decaimiento gradual negativo en los rezagos consecutivos ($k=2, 3, 4, 5$) hacia cero. Esta atenuación confirma la estructura MA(1)
+
+El segundo candidato mejor ubicado en la tabla BIC es $\text{ARIMA}(0,1,1)(1,1,1)_4$, con $\text{BIC} = -190.3564$.La ACF muestra un pico negativo pronunciado en el primer rezago estacional ($k=12$ y se anula en los múltiplos siguientes ($k=24$ y $k=36$). Además, el leve repunte positivo en $k=13$ es un efecto típico de la interacción multiplicativa entre un término MA(1) y un SMA(1). La PACF exhibe picos negativos significativos no solo en $k=12$ ($\approx -0.44$), sino también una persistencia marcada en el segundo rezago estacional $k=24$ (2.0, $\approx -0.36$), antes de moderarse en $k=36$
+
+La diferencia es de $1.1766$ unidades ($\vert{}-190.3564 - (-191.5330)\vert{}$). Según la escala de Kass y Raftery, al ser menor a 2 unidades, la evidencia no separa ambos modelos, por lo que no se descarta el segundo candidato y ambos avanzan a la etapa de diagnóstico.
+
+
+
+## B4
+
+### ajuste
+
+```{r}
+
+m1 <- arima(lz, order = c(0,1,1), 
+            seasonal = list(order = c(0,1,1), period = 4))
+
+m2 <- arima(lz, order = c(0,1,1), 
+            seasonal = list(order = c(1,1,1), period = 4))
+
+m1
+
+
+
+```
+
+```{r}
+m2
+```
+
+
+### Estimacion
+
+```{r}
+
+tabla_t <- function(fit) {
+  est <- coef(fit)
+  ee  <- sqrt(diag(fit$var.coef))
+  data.frame(estimacion = est, ee = ee, t = est / ee)
+}
+
+```
+
+### modelo 1: ARIMA(0,1,1)(0,1,1)
+
+```{r}
+tabla_t(m1)
+```
+
+### modelo 2: ARIMA(0,1,1)(1,1,1)
+
+```{r}
+
+tabla_t(m2)
+
+```
+
+
+### validacion 
+
+```{r}
+
+LB <- function(fit, Ks = c(8, 12, 16)) {
+  m <- length(coef(fit))                 # no hay constante, porque d + D = 2
+  do.call(rbind, lapply(Ks, function(K) {
+    b <- Box.test(residuals(fit), lag = K, type = "Ljung-Box", fitdf = m)
+    data.frame(K = K, gl = K - m, Q = unname(b$statistic), p_valor = b$p.value)
+  }))
+}
+
+```
+
+### lb modelo 1 (m1)
+
+```{r}
+LB(m1)
+```
+### lb modelo 2 (m2)
+
+```{r}
+LB(m2)
+```
+### normalidad m1 y m2
+
+```{r}
+
+shapiro.test(residuals(m1))
+shapiro.test(residuals(m2))
+
+```
+```{r}
+
+qqnorm(m1$residuals, main = "Q-Q Plot de los Residuos ARIMA(0,1,1)(0,1,1)_4", pch = 16, col = "darkslategray")
+qqline(m1$residuals, col = "firebrick", lwd = 2)
+
+
+```
+
+
+```{r}
+
+qqnorm(m2$residuals, main = "Q-Q Plot de los Residuos ARIMA(0,1,1)(1,1,1)_4", pch = 16, col = "darkslategray")
+qqline(m2$residuals, col = "firebrick", lwd = 2)
+
+
+```
+
+```{r}
+checkresiduals(m1)
+```
+
+
+```{r}
+
+checkresiduals(m2)
+
+```
+
+
+### Atipicos
+
+
+```{r}
+
+at1 <- tso(lz, types = c("AO", "LS", "TC", "IO"), 
+                  delta = 0.7, cval = 3.5,
+                  tsmethod = "arima",
+                  args.tsmethod = list(order = c(0,1,1),
+                                       seasonal = list(order = c(0,1,1),
+                                                       period = 4)))
+at1
+
+
+
+```
+
+
+```{r}
+
+at2 <- tso(lz, types = c("AO", "LS", "TC", "IO"), delta = 0.7, cval = 3.5,
+                  tsmethod = "arima",
+                  args.tsmethod = list(order = c(0,1,1),
+                                       seasonal = list(order = c(1,1,1), period = 4)))
+at2
+
+```
+
+
+M1 (airline): $\text{ARIMA}(0,1,1)(0,1,1)_4$
+$$\nabla \nabla_4 \ln Z_t = (1 - \theta B)(1 - \Theta B^4) a_t$$
+con $\hat{\theta} = -\text{ma1} = 0.6860$ y $\hat{\Theta} = -\text{sma1} = 0.6140$ ($\hat{\sigma}^2 = 0.005231$). Estadísticos $t$: $t_{\text{ma1}} = -9.67$ y $t_{\text{sma1}} = -7.49$; ambos son altamente significativos ($\vert{}t\vert{} > 2$).
+
+
+M2: $\text{ARIMA}(0,1,1)(1,1,1)_4$
+$$(1 - \Phi B^4)\nabla \nabla_4 \ln Z_t = (1 - \theta B)(1 - \Theta B^4) a_t$$
+con $\hat{\Phi} = \text{sar1} = -0.2961$, $\hat{\theta} = -\text{ma1} = 0.6729$ y $\hat{\Theta} = -\text{sma1} = 0.4475$ ($\hat{\sigma}^2 = 0.005015$). Estadísticos $t$: $t_{\text{ma1}} = -9.28$, $t_{\text{sar1}} = -1.964$ y $t_{\text{sma1}} = -3.32$.Prueba de Ljung-Box: Con $m = 2$ en M1 ($gl = K - 2$) y $m = 3$ en M2 ($gl = K - 3$)
+
+
+Al 5% de significancia, M1 presenta autocorrelación residual en los rezagos $K = 8$ y $K = 12$ ($p < 0.05$), por lo que no cumple el supuesto de ruido blanco. En contraste, M2 no muestra autocorrelación residual en ninguno de los rezagos evaluados (todos los $p > 0.05$).
+
+Normalidad (Shapiro-Wilk): En ambos modelos no se rechaza la normalidad de los residuales al 5% (M1: $W = 0.9840$, $p = 0.3297$; M2: $W = 0.9771$, $p = 0.1085$).
+
+No se detectó ningún valor atípico en ninguno de los dos modelos. En M2, el parámetro $\text{sar1}$ tiene $\vert{}t\vert{} = 1.964 < 2$, ubicándose justo en el límite de la significancia individual al 5% ($1.96$). Sin embargo, no conviene eliminarlo, ya que prescindir de él reduce el modelo a M1, el cual falla la prueba de ruido blanco de Ljung-Box y presenta mayor varianza residual
+
+
+
+## B5
+
+```{r}
+ltr   <- log(train)                                                                     
+m1_tr <- arima(ltr, order = c(0,1,1), seasonal = list(order = c(0,1,1), period = 4))   # M1
+m2_tr <- arima(ltr, order = c(0,1,1), seasonal = list(order = c(1,1,1), period = 4))   # M2
+
+p1 <- predict(m1_tr, n.ahead = h)   
+p2 <- predict(m2_tr, n.ahead = h)
+
+sn <- snaive(train, h = h)$mean    # ingenuo estacional (escala original)
+
+hw <- predict(HoltWinters(train, seasonal = "multiplicative"),
+              n.ahead = h)         # Holt-Winters multiplicativo
+
+pron <- data.frame(
+  real       = as.numeric(test),
+  M1_mediana = exp(p1$pred),            # mediana en escala original
+  M1_media   = exp(p1$pred + p1$se^2 / 2), # media retransformada:
+  M2_mediana = exp(p2$pred),
+  ing_estac  = as.numeric(sn),
+  HW_mult    = as.numeric(hw)
+)
+
+# RMSE, MAPE y MASE. Escala del MASE: MAE del ingenuo estacional en entrenamiento
+escala <- mean(abs(diff(train, lag = 4)))
+
+metricas <- function(f) {
+  e <- pron$real - f
+  c(RMSE = sqrt(mean(e^2)),
+    MAPE = 100 * mean(abs(e) / pron$real),
+    MASE = mean(abs(e)) / escala)
+}
+
+tabla_val <- sapply(pron[, -1], metricas)
+round(t(tabla_val), 2)
+
+# Ganador por RMSE y brecha con el segundo lugar
+rmse_ord <- sort(tabla_val["RMSE", ])
+rmse_ord
+round(diff(rmse_ord[1:2]), 2)
+
+```
+Con la validación 2010-T4 a 2012-T3 (h = 8), Holt-Winters multiplicativo tiene el menor error en las tres métricas (RMSE = 7.61; MAPE = 3.39 %; MASE = 0.54). Le siguen M2 mediana (RMSE = 8.15; MAPE = 3.92 %; MASE = 0.63), M1 mediana (8.34; 4.36 %; 0.68), M1 media (8.54; 4.67 %; 0.73) y el ingenuo estacional (14.27; 7.32 %; 1.17). El ingenuo estacional es el peor, con un MASE de 1.17, lo que confirma que los modelos aprovechan mejor la estructura de la serie. Entre los dos ARIMA, M2 supera a M1 con la mediana, en línea con lo que se concluyó anteriormente.
+
+Como la transformación exponencial es convexa, la distribución en escala original tiene cola a la derecha y su media supera a su mediana en el factor exp(v̂/2). Este factor crece con el horizonte, porque v̂ aumenta con h. Si el modelo es correcto, la media es el pronóstico de menor MSE en escala original, porque es el valor esperado condicional, mientras que la mediana minimiza el error absoluto. En esta validación, sin embargo, M1 media (RMSE = 8.54) fue peor que M1 mediana (8.34): con solo 8 observaciones, esa diferencia es variabilidad muestral y no contradice la teoría
+
+
+Holt-Winters multiplicativo es el método con mejor desempeño en validación, con RMSE = 7.61 frente a 8.15 de M2 mediana ($\text{ARIMA}(0,1,1)(1,1,1)_4$), que es el segundo. La diferencia es de 0.54 miles de visitantes por trimestre, es decir, unos 540 viajeros. Frente a un nivel de la serie que en el periodo de validación oscila entre ~90 y ~200 mil visitantes, la brecha es pequeña y no justifica por sí sola descartar el modelo ARIMA.
 
 
 
 
 
+## B6
+
+
+```{r}
+
+fin <- arima(lz, order = c(0,1,1),
+             seasonal = list(order = c(1,1,1), period = 4))   # M2, elegido en B4 y B5
+pf  <- predict(fin, n.ahead = 8)   # h = 1 es 2012-T4; h = 8 es 2014-T3
+
+tab_final <- data.frame(
+  trimestre = c("2012-T4", "2013-T1", "2013-T2", "2013-T3",
+                "2013-T4", "2014-T1", "2014-T2", "2014-T3"),
+  h       = 1:8,
+  mediana = round(exp(pf$pred), 2),
+  li95    = round(exp(pf$pred - 1.96 * pf$se), 2),
+  ls95    = round(exp(pf$pred + 1.96 * pf$se), 2),
+  media   = round(exp(pf$pred + pf$se^2 / 2), 2)       # media retransformada
+)
+
+
+
+
+total_2013 <- sum(tab_final$media[2:5])
+total_2011 <- sum(window(serie_ts_B, start = c(2011, 1), end = c(2011, 4)))
+
+
+```
+
+
+```{r}
+tab_final
+```
+
+```{r}
+
+c(total_2013   = total_2013,
+  total_2011   = total_2011,
+  variacion_pct = 100 * (total_2013 - total_2011) / total_2011)
+
+```
+
+```{r}
+tab_final[c(1, 8), ]
+```
+
+
+
+
+Se elige M2, $\text{ARIMA}(0,1,1)(1,1,1)_4$, como modelo final. En B4 es el único que cumple el supuesto de ruido blanco en $K=8, 12, 16$) ($p = 0.156, 0.137$ y $0.289$), tiene residuales normales($W=0.977, p=0.109$), no presenta atípicos y tiene menor varianza residual ($\hat{\sigma}^2_{m1} = 0.005015$ vs. $\hat{\sigma}^2_{m2} = 0.005231$). En B5 es el mejor ARIMA en las tres métricas, con RMSE = 8.15 frente a 8.34 de M1, y solo Holt-Winters lo supera, por 0.54 miles de visitantes. Holt-Winters no se adopta como modelo final porque en este trabajo no tiene residuales validados ni intervalos de predicción calculados, y con 8 observaciones de validación su ventaja no es lo bastante sólida para reemplazar un modelo con diagnóstico completo; se mantiene como alternativa de referencia.
+
+
+El modelo ajustado con toda la serie pronostica para 2012-T4 una mediana de 200.2 mil visitantes, con IC 95 % [174.3; 230.0] (media 200.7). Para 2014-T3 pronostica 94.4 mil, con IC 95 % [76.9; 115.8] (media 94.9). En escala original, el intervalo de 2012-T4 es más ancho en unidades absolutas, pero en términos relativos es más amplio en 2014-T3 (±21 % frente a ±14 %), porque la incertidumbre en escala logarítmica crece con el horizonte.
+
+La suma de las medias de 2013 (2013-T1 a 2013-T4) es 567.67 miles de visitantes, frente a 608.10 miles observados en 2011. Esto representa una disminución esperada de 40.43 miles, equivalente a −6.6 %. Como es un pronóstico puntual con intervalos amplios por trimestre,  siendo una tendencia moderada a la baja y no es un valor exacto.
+
+### mensaje 
+
+Para el verano austral de 2012-2013 (2012-T4 y 2013-T1) el modelo prevé unos 200 mil y 182 mil visitantes respectivamente, pero el intervalo de 95 % es amplio (de 174 a 230 mil en 2012-T4) y (de 157 a 210 mil en 2013-T1), por lo que la capacidad debe planearse para almenos 230 mil viajeron en el trimestre 2012-T4  y reduzcan su capacidad hasta 210 mil pasajeros en el trimestre 2013-T1. Para los siguientes trimestres se espera que se reduzcan los viajeros en cada trimestre a comparacion de años anteriores. Se recomienda hacer un estudio frecuente para dar cifras mas precisas
+
+El riesgo de Planear la capacidad con la media en lugar de la mediana es debido a que eleva el pronóstico solo unos 0.5 mil visitantes por trimestre, ademas la media esta sujeta a valores extremos presentes mientras que la mediana no haciendola mas estable.
+
+
+
+# Uso de IA
+
+Se utilizó la IA Claude Haiku 5.5-high como asistente principalmente en el desarrollo de código y en la búsqueda de funciones óptimas, especialmente para los puntos B4 y B6 del caso B. Su uso incluyó:
+
+Escritura y revisión de código en R para el diagnóstico de residuos (pruebas de Ljung-Box y revisión de atípicos) y para el modelo final, sus pronósticos, intervalos del 95 % y la media retransformada.
+
+Redacción en LaTeX de la estructura, tablas y figuras del documento técnico.
+Creación de un archivo YAML funcional para el HTML del trabajo.
 
