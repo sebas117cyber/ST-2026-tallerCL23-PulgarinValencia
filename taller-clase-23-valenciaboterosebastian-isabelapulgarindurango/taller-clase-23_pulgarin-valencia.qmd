@@ -2256,10 +2256,13 @@ El riesgo de Planear la capacidad con la media en lugar de la mediana es debido 
 
 # Uso de IA
 
-Se utilizó la IA Claude Haiku 5.5-high como asistente principalmente en el desarrollo de código y en la búsqueda de funciones óptimas, especialmente para los puntos B4 y B6 del caso B. Su uso incluyó:
+Para la elaboración de este trabajo se utilizó ChatGPT y Claude como herramientas de apoyo. Su uso se limitó a:
 
-Escritura y revisión de código en R para el diagnóstico de residuos (pruebas de Ljung-Box y revisión de atípicos) y para el modelo final, sus pronósticos, intervalos del 95 % y la media retransformada.
+- Apoyar la comprensión e interpretación de la *prueba HEGY* y sus resultados.
+- Ayudar a identificar y corregir *errores en el código de R y Quarto* durante la elaboración del análisis.
+- Sugerir mejoras en la *redacción e interpretación* de algunos resultados.
+- Apoyar la organización y presentación de tablas y resultados.
+- Sugerir ajustes en los *colores, títulos y formato de las gráficas* para mejorar su presentación.
+- Revisar la sintaxis de algunos fragmentos de código y proponer alternativas más sencillas.
 
-Redacción en LaTeX de la estructura, tablas y figuras del documento técnico.
-Creación de un archivo YAML funcional para el HTML del trabajo.
-
+Los análisis, decisiones sobre los modelos y resultados presentados fueron revisados por el equipo y corresponden a los procedimientos desarrollados para el trabajo.
